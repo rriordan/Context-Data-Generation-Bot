@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Context Data Generation Bot — interactive CLI for building personalized LLM context snippets."""
+"""Context Data Generation Bot — interactive CLI for building personalized LLM context snippets.
 
-import os
+Uses the `claude` CLI for all model calls rather than the Anthropic SDK directly.
+"""
+
 import re
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
-import anthropic
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -36,7 +38,7 @@ fictional characters)
 hypothetical inventions)
 
 When suggesting topics, try to suggest ones that will yield a few pieces of information \
-together rather than just one data point. Exception: levels 4–5 may focus on a single \
+together rather than just one data point. Exception: levels 4-5 may focus on a single \
 very obscure data point.
 
 Respond with ONLY the topic question — no preamble, no explanation, just the question itself.\
@@ -76,56 +78,50 @@ in traveling to Iceland.
 
 console = Console(theme=Theme({"success": "green", "info": "cyan", "warn": "yellow"}))
 
+MODEL = "claude-opus-4-7"
 
-def suggest_topic(client: anthropic.Anthropic, obscurity_level: int) -> str:
+
+def _claude(system_prompt: str, user_message: str) -> str:
+    """Call the `claude` CLI in non-interactive mode and return the response text."""
+    result = subprocess.run(
+        [
+            "claude",
+            "--print",
+            "--model", MODEL,
+            "--system-prompt", system_prompt,
+            "--tools", "",          # disable all tools — pure text generation
+            "--output-format", "text",
+            user_message,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        err = result.stderr.strip() or result.stdout.strip()
+        console.print(f"[warn]claude CLI error (exit {result.returncode}):[/warn] {err}")
+        sys.exit(1)
+    return result.stdout.strip()
+
+
+def suggest_topic(obscurity_level: int) -> str:
     """Ask Claude to suggest a topic at the given obscurity level."""
-    response = client.messages.create(
-        model="claude-opus-4-7",
-        max_tokens=256,
-        system=[
-            {
-                "type": "text",
-                "text": TOPIC_SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=[
-            {
-                "role": "user",
-                "content": f"Suggest a topic at obscurity level {obscurity_level}.",
-            }
-        ],
+    return _claude(
+        TOPIC_SYSTEM_PROMPT,
+        f"Suggest a topic at obscurity level {obscurity_level}.",
     )
-    return response.content[0].text.strip()
 
 
-def format_context(
-    client: anthropic.Anthropic, user_name: str, topic: str, user_input: str
-) -> str:
+def format_context(user_name: str, topic: str, user_input: str) -> str:
     """Format raw user input into a structured context snippet."""
-    response = client.messages.create(
-        model="claude-opus-4-7",
-        max_tokens=1024,
-        system=[
-            {
-                "type": "text",
-                "text": FORMATTER_SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    f"User's name: {user_name}\n"
-                    f"Topic/Question: {topic}\n"
-                    f"User's response: {user_input}\n\n"
-                    "Please format this into a contextual snippet."
-                ),
-            }
-        ],
+    return _claude(
+        FORMATTER_SYSTEM_PROMPT,
+        (
+            f"User's name: {user_name}\n"
+            f"Topic/Question: {topic}\n"
+            f"User's response: {user_input}\n\n"
+            "Please format this into a contextual snippet."
+        ),
     )
-    return response.content[0].text.strip()
 
 
 def extract_snippet(formatted_response: str) -> str:
@@ -193,12 +189,12 @@ def prompt_obscurity() -> int:
 
 # ── Session loop ──────────────────────────────────────────────────────────────
 
-def run_session(client: anthropic.Anthropic, user_name: str) -> None:
+def run_session(user_name: str) -> None:
     """Run one full cycle: topic → input → format → (optionally) save."""
     obscurity = prompt_obscurity()
 
     console.print("\n[info]Generating topic…[/info]")
-    topic = suggest_topic(client, obscurity)
+    topic = suggest_topic(obscurity)
     console.print(Panel(topic, title="[green]Suggested Topic[/green]", border_style="green"))
 
     user_input = collect_multiline_input()
@@ -207,7 +203,7 @@ def run_session(client: anthropic.Anthropic, user_name: str) -> None:
         return
 
     console.print("\n[info]Formatting your context snippet…[/info]")
-    formatted = format_context(client, user_name, topic, user_input)
+    formatted = format_context(user_name, topic, user_input)
     snippet_content = extract_snippet(formatted)
 
     console.print(
@@ -234,20 +230,19 @@ def main() -> None:
         )
     )
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    # Verify the claude CLI is available
+    if subprocess.run(["claude", "--version"], capture_output=True).returncode != 0:
         console.print(
-            "[warn]ANTHROPIC_API_KEY is not set.\n"
-            "Export it first:  export ANTHROPIC_API_KEY=your_key_here[/warn]"
+            "[warn]The `claude` CLI was not found. "
+            "Install it from https://claude.ai/code and try again.[/warn]"
         )
         sys.exit(1)
-
-    client = anthropic.Anthropic()
 
     user_name = Prompt.ask("\n[info]What's your name?[/info]").strip() or "User"
     console.print(f"\n[success]Hello, {user_name}! Let's build your context library.[/success]")
 
     while True:
-        run_session(client, user_name)
+        run_session(user_name)
         if not Confirm.ask("\n[info]Generate another snippet?[/info]", default=True):
             break
 
