@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Context Data Generation Bot — interactive CLI for building personalized LLM context snippets.
 
-Uses the `claude` CLI for all model calls rather than the Anthropic SDK directly.
+Uses the `claude` CLI for all model calls. Profiles are persisted under profiles/<name>/.
 """
 
+import json
 import re
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -14,150 +16,242 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
+from rich.table import Table
 from rich.theme import Theme
 
-# ── System prompts (drawn from configurations/) ──────────────────────────────
+# ── Question pool ─────────────────────────────────────────────────────────────
+# Ordered by how much the context is likely to improve AI responses.
+# Sections progress from high-signal fundamentals to niche/personal details.
 
-TOPIC_SYSTEM_PROMPT = """\
-Your purpose is to act as a friendly assistant helping the user generate a library \
-of contextual data to enhance the capabilities of a large language model tool.
+@dataclass
+class Question:
+    id: str
+    section: str
+    text: str
 
-The user's intention is to provide a broad store of contextual data which can be used \
-for the purpose of making the LLM's outputs more targeted and personalized.
 
-Your function is to suggest a single random topic for a piece of contextual data that \
-the user should generate.
+QUESTIONS: list[Question] = [
+    # ── Identity ── highest signal; used in nearly every interaction
+    Question("full_name",       "Identity",       "What is your full name?"),
+    Question("location",        "Identity",       "Where do you currently live? (city and country)"),
+    Question("occupation",      "Identity",       "What is your occupation or job title?"),
+    Question("industry",        "Identity",       "What industry or field do you work in?"),
+    Question("languages",       "Identity",       "What languages do you speak, and at what level of fluency?"),
+    Question("nationality",     "Identity",       "What is your nationality or cultural background?"),
+    Question("age_range",       "Identity",       "What is your age or approximate age range?"),
 
-The user will specify an obscurity level from 1 to 5:
-- Level 1: Very basic, not obscure (e.g., city of birth, nationality)
-- Level 2: Somewhat basic (e.g., career aspirations, dream travel destinations, music taste)
-- Level 3: Medium obscurity (e.g., unexpected skills, hobbies most people wouldn't guess)
-- Level 4: Quite obscure (e.g., niche interests, unusual food combinations, favourite \
-fictional characters)
-- Level 5: Highly obscure (e.g., intricate dreams, bizarre connections between topics, \
-hypothetical inventions)
+    # ── AI interaction preferences ── directly shape every response
+    Question("response_format", "AI Preferences", "How do you prefer AI responses to be formatted? "
+                                                   "(e.g. bullet points, prose, tables, code blocks)"),
+    Question("response_length", "AI Preferences", "Do you prefer concise answers or thorough explanations?"),
+    Question("tone",            "AI Preferences", "What tone do you prefer from an AI assistant? "
+                                                   "(e.g. formal, casual, direct, friendly)"),
+    Question("technical_depth", "AI Preferences", "What level of technical depth do you prefer? "
+                                                   "(e.g. plain English, intermediate, expert-level)"),
+    Question("expert_areas",    "AI Preferences", "What subjects are you already expert in, so an AI "
+                                                   "can skip basic explanations?"),
+    Question("ai_use_cases",    "AI Preferences", "What tasks do you most often use AI assistants for?"),
 
-When suggesting topics, try to suggest ones that will yield a few pieces of information \
-together rather than just one data point. Exception: levels 4-5 may focus on a single \
-very obscure data point.
+    # ── Professional ── high signal for work-related queries
+    Question("top_skills",      "Professional",   "What are your most important professional skills?"),
+    Question("career_goals",    "Professional",   "What are your main career goals or ambitions?"),
+    Question("education",       "Professional",   "Describe your educational background."),
+    Question("tools_tech",      "Professional",   "What software, tools, or technologies do you use regularly?"),
+    Question("work_challenges", "Professional",   "What are your biggest professional challenges right now?"),
+    Question("current_projects","Professional",   "What kind of projects or work are you currently focused on?"),
+    Question("work_style",      "Professional",   "How would colleagues describe your working style?"),
 
-Respond with ONLY the topic question — no preamble, no explanation, just the question itself.\
-"""
+    # ── Personal context ── useful for lifestyle and general queries
+    Question("hobbies",         "Personal",       "What are your main hobbies and interests?"),
+    Question("family",          "Personal",       "Describe your family or household situation."),
+    Question("health",          "Personal",       "Do you have any health considerations, dietary restrictions, "
+                                                   "or physical limitations worth knowing?"),
+    Question("living_situation","Personal",       "Describe your living situation. "
+                                                   "(e.g. own/rent, house/flat, city/rural)"),
+    Question("social_energy",   "Personal",       "Are you more introverted or extroverted, "
+                                                   "and what socially energises or drains you?"),
 
-FORMATTER_SYSTEM_PROMPT = """\
-You are a context data formatting tool. Your purpose is to transform raw user input into \
-clean, structured contextual snippets suitable for storage in a vector database.
+    # ── Preferences ──
+    Question("music",           "Preferences",    "Describe your taste in music."),
+    Question("books_films",     "Preferences",    "What genres of books, films, or TV shows do you enjoy?"),
+    Question("travel",          "Preferences",    "What are your favourite or dream travel destinations?"),
+    Question("food",            "Preferences",    "What are your food preferences, favourite cuisines, "
+                                                   "or notable dislikes?"),
+    Question("sport_fitness",   "Preferences",    "What sports, fitness activities, or outdoor pursuits "
+                                                   "do you enjoy?"),
 
-You will receive:
-1. The user's name
-2. The topic/question that was suggested
-3. The user's raw response (which may be informal, include speech artefacts, or be unstructured)
+    # ── Values & worldview ──
+    Question("core_values",     "Values",         "What are your core personal values?"),
+    Question("causes",          "Values",         "What social, environmental, or political causes "
+                                                   "matter most to you?"),
+    Question("philosophy",      "Values",         "Describe your philosophical, religious, or spiritual outlook."),
+    Question("political_views", "Values",         "How would you describe your political views? "
+                                                   "(optional — skip if preferred)"),
 
-Your task:
-- Extract only persistent, useful contextual information (not ephemeral facts like today's weather)
-- Rewrite all information in the third person using the user's name
-- Organise information under appropriate markdown headings
-- Group similar pieces of information together
-- Remove filler words, redundancies, and irrelevant content
-- Return ONLY the formatted snippet inside a markdown code fence, with no additional commentary \
-before or after it
+    # ── Quirks & specifics ── lower signal but adds colour
+    Question("unusual_skills",  "Quirks",         "What is an unusual skill or hobby most people "
+                                                   "don't know you have?"),
+    Question("strong_opinions", "Quirks",         "What is a strong opinion you hold that might "
+                                                   "surprise people?"),
+    Question("pet_peeves",      "Quirks",         "What are your biggest pet peeves?"),
+    Question("niche_interests", "Quirks",         "What niche topics can you talk about endlessly?"),
+    Question("motivators",      "Quirks",         "What motivates or energises you most?"),
+    Question("ideal_day",       "Quirks",         "Describe your ideal day."),
+    Question("ai_wish",         "Quirks",         "What recurring problem in your life do you "
+                                                   "most wish an AI could help with?"),
+    Question("deep_knowledge",  "Quirks",         "What topic do you know surprisingly well "
+                                                   "compared to most people?"),
+    Question("fictional_ident", "Quirks",         "Which fictional character do you most identify with, "
+                                                   "and why?"),
+    Question("thinking_style",  "Quirks",         "What is the most important thing to understand "
+                                                   "about how you think or make decisions?"),
+]
 
-Example — if the user's name is "Daniel" and they say \
-"um I've always wanted to visit Japan for the culture and food, oh and Iceland too":
+SECTIONS = list(dict.fromkeys(q.section for q in QUESTIONS))  # ordered, deduped
 
+# ── Profile ───────────────────────────────────────────────────────────────────
+
+PROFILES_DIR = Path("profiles")
+LAST_USED_FILE = PROFILES_DIR / "last_used.txt"
+
+
+@dataclass
+class Profile:
+    name: str
+    answered: dict[str, str] = field(default_factory=dict)   # q.id → snippet filename
+    skipped: list[str] = field(default_factory=list)
+
+    @property
+    def dir(self) -> Path:
+        return PROFILES_DIR / _safe_name(self.name)
+
+    @property
+    def json_path(self) -> Path:
+        return self.dir / "profile.json"
+
+    @property
+    def snippets_dir(self) -> Path:
+        return self.dir / "snippets"
+
+    def save(self) -> None:
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.snippets_dir.mkdir(exist_ok=True)
+        self.json_path.write_text(
+            json.dumps({"name": self.name, "answered": self.answered, "skipped": self.skipped},
+                       indent=2),
+            encoding="utf-8",
+        )
+        LAST_USED_FILE.write_text(self.name, encoding="utf-8")
+
+    @classmethod
+    def load(cls, name: str) -> "Profile":
+        path = PROFILES_DIR / _safe_name(name) / "profile.json"
+        if not path.exists():
+            return cls(name=name)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return cls(name=data["name"], answered=data.get("answered", {}),
+                   skipped=data.get("skipped", []))
+
+    @classmethod
+    def last_used_name(cls) -> str | None:
+        if LAST_USED_FILE.exists():
+            name = LAST_USED_FILE.read_text(encoding="utf-8").strip()
+            if name and (PROFILES_DIR / _safe_name(name)).exists():
+                return name
+        return None
+
+
+def _safe_name(name: str) -> str:
+    return re.sub(r"[^\w\-]", "_", name.lower())
+
+
+# ── Claude CLI ────────────────────────────────────────────────────────────────
+
+MODEL = "claude-opus-4-7"
+
+FORMATTER_SYSTEM = """\
+You are a context data formatting tool. Transform raw user input into clean, structured \
+contextual snippets for a vector database that will ground an LLM.
+
+You will receive the user's name, the question asked, and their raw response.
+
+Rules:
+- Extract only persistent facts (not ephemeral things like today's weather)
+- Rewrite everything in the third person using the user's name
+- Group related facts under markdown headings
+- Remove filler words, repetition, and irrelevant content
+- Return ONLY the formatted snippet inside a markdown code fence — no commentary outside it
+
+Example (name: Daniel, question: dream travel destinations):
 ```markdown
 ## Travel Preferences
 
 ### Dream Destinations
-Daniel dreams of visiting Japan, drawn by its culture and cuisine. He is also interested \
-in traveling to Iceland.
-```\
-"""
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
+Daniel dreams of visiting Japan for its culture and cuisine. He is also drawn to Iceland \
+for its landscapes and hot springs.
+```"""
 
 console = Console(theme=Theme({"success": "green", "info": "cyan", "warn": "yellow"}))
 
-MODEL = "claude-opus-4-7"
-
 
 def _claude(system_prompt: str, user_message: str) -> str:
-    """Call the `claude` CLI in non-interactive mode and return the response text."""
     result = subprocess.run(
-        [
-            "claude",
-            "--print",
-            "--model", MODEL,
-            "--system-prompt", system_prompt,
-            "--tools", "",          # disable all tools — pure text generation
-            "--output-format", "text",
-            user_message,
-        ],
-        capture_output=True,
-        text=True,
+        ["claude", "--print", "--model", MODEL,
+         "--system-prompt", system_prompt,
+         "--tools", "", "--output-format", "text",
+         user_message],
+        capture_output=True, text=True,
     )
     if result.returncode != 0:
         err = result.stderr.strip() or result.stdout.strip()
-        console.print(f"[warn]claude CLI error (exit {result.returncode}):[/warn] {err}")
+        console.print(f"[warn]claude error (exit {result.returncode}):[/warn] {err}")
         sys.exit(1)
     return result.stdout.strip()
 
 
-def suggest_topic(obscurity_level: int) -> str:
-    """Ask Claude to suggest a topic at the given obscurity level."""
+def format_context(user_name: str, question: str, user_input: str) -> str:
     return _claude(
-        TOPIC_SYSTEM_PROMPT,
-        f"Suggest a topic at obscurity level {obscurity_level}.",
+        FORMATTER_SYSTEM,
+        f"User's name: {user_name}\nQuestion: {question}\nResponse: {user_input}\n\n"
+        "Format this into a contextual snippet.",
     )
 
 
-def format_context(user_name: str, topic: str, user_input: str) -> str:
-    """Format raw user input into a structured context snippet."""
-    return _claude(
-        FORMATTER_SYSTEM_PROMPT,
-        (
-            f"User's name: {user_name}\n"
-            f"Topic/Question: {topic}\n"
-            f"User's response: {user_input}\n\n"
-            "Please format this into a contextual snippet."
-        ),
-    )
+def extract_snippet(text: str) -> str:
+    m = re.search(r"```(?:markdown)?\n(.*?)```", text, re.DOTALL)
+    return m.group(1).strip() if m else text
 
 
-def extract_snippet(formatted_response: str) -> str:
-    """Pull markdown content out of a code fence if present."""
-    match = re.search(r"```(?:markdown)?\n(.*?)```", formatted_response, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return formatted_response
+# ── UI helpers ────────────────────────────────────────────────────────────────
+
+def show_progress(profile: Profile) -> None:
+    table = Table(title=f"Context library — {profile.name}", show_header=True,
+                  header_style="bold cyan")
+    table.add_column("Section")
+    table.add_column("Done", justify="right")
+    table.add_column("Skipped", justify="right")
+    table.add_column("Remaining", justify="right")
+
+    total_done = total_skipped = total_remaining = 0
+    for section in SECTIONS:
+        qs = [q for q in QUESTIONS if q.section == section]
+        done = sum(1 for q in qs if q.id in profile.answered)
+        skipped = sum(1 for q in qs if q.id in profile.skipped and q.id not in profile.answered)
+        remaining = len(qs) - done - skipped
+        table.add_row(section, str(done), str(skipped) if skipped else "—", str(remaining))
+        total_done += done; total_skipped += skipped; total_remaining += remaining
+
+    table.add_section()
+    table.add_row("[bold]Total[/bold]", f"[bold]{total_done}[/bold]",
+                  f"[bold]{total_skipped}[/bold]" if total_skipped else "—",
+                  f"[bold]{total_remaining}[/bold]")
+    console.print(table)
 
 
-def save_snippet(snippet_content: str, user_name: str, topic: str) -> Path:
-    """Save a snippet as a markdown file under output/."""
-    output_dir = Path("output")
-    output_dir.mkdir(exist_ok=True)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_topic = re.sub(r"[^\w\s-]", "", topic[:40]).strip().replace(" ", "_").lower()
-    filename = f"{timestamp}_{safe_topic}.md"
-    filepath = output_dir / filename
-
-    header = (
-        f"---\n"
-        f"generated: {datetime.now().isoformat()}\n"
-        f"subject: {user_name}\n"
-        f"topic: {topic}\n"
-        f"---\n\n"
-    )
-    filepath.write_text(header + snippet_content + "\n", encoding="utf-8")
-    return filepath
-
-
-def collect_multiline_input() -> str:
-    """Read multi-line input until the user submits a blank line."""
-    console.print(
-        "[info]Share your thoughts below. Press Enter on a blank line when done.[/info]"
-    )
+def collect_multiline_input(prompt_text: str = "") -> str:
+    if prompt_text:
+        console.print(f"[info]{prompt_text}[/info]")
+    console.print("[dim]Press Enter on a blank line when done.[/dim]")
     lines: list[str] = []
     while True:
         line = input()
@@ -167,70 +261,154 @@ def collect_multiline_input() -> str:
     return "\n".join(lines).strip()
 
 
-def prompt_obscurity() -> int:
-    """Display obscurity descriptions and return the chosen level (1–5)."""
-    console.print("\n[info]Obscurity levels:[/info]")
-    descriptions = [
-        "1 – Basic          (city of birth, nationality)",
-        "2 – Common         (career aspirations, music taste)",
-        "3 – Moderate       (unexpected skills, hidden hobbies)",
-        "4 – Obscure        (niche interests, unusual preferences)",
-        "5 – Very obscure   (hypothetical scenarios, bizarre connections)",
-    ]
-    for d in descriptions:
-        console.print(f"  {d}")
+def next_question(profile: Profile) -> Question | None:
+    """Return the next unanswered, non-skipped question, or None if all done."""
+    done_or_skipped = set(profile.answered) | set(profile.skipped)
+    for q in QUESTIONS:
+        if q.id not in done_or_skipped:
+            return q
+    return None
+
+
+def pick_answered_question(profile: Profile) -> Question | None:
+    """Let the user pick a previously answered question to re-answer."""
+    answered_qs = [q for q in QUESTIONS if q.id in profile.answered]
+    if not answered_qs:
+        console.print("[warn]No answered questions yet.[/warn]")
+        return None
+
+    console.print("\n[info]Answered questions:[/info]")
+    for i, q in enumerate(answered_qs, 1):
+        console.print(f"  [{i}] ({q.section}) {q.text}")
+    console.print("  [0] Cancel")
 
     while True:
-        raw = Prompt.ask("\n[info]Choose obscurity level[/info]", default="3")
-        if raw.isdigit() and 1 <= int(raw) <= 5:
-            return int(raw)
-        console.print("[warn]Please enter a number between 1 and 5.[/warn]")
+        raw = Prompt.ask("Pick a number").strip()
+        if raw == "0":
+            return None
+        if raw.isdigit() and 1 <= int(raw) <= len(answered_qs):
+            return answered_qs[int(raw) - 1]
+        console.print("[warn]Invalid choice.[/warn]")
 
 
-# ── Session loop ──────────────────────────────────────────────────────────────
+# ── Session ───────────────────────────────────────────────────────────────────
 
-def run_session(user_name: str) -> None:
-    """Run one full cycle: topic → input → format → (optionally) save."""
-    obscurity = prompt_obscurity()
-
-    console.print("\n[info]Generating topic…[/info]")
-    topic = suggest_topic(obscurity)
-    console.print(Panel(topic, title="[green]Suggested Topic[/green]", border_style="green"))
+def answer_question(profile: Profile, q: Question, is_edit: bool = False) -> None:
+    """Present a question, collect the answer, format it, and save."""
+    label = "Re-answering" if is_edit else "Question"
+    console.print(Panel(
+        f"[bold]{q.text}[/bold]\n[dim]Section: {q.section}[/dim]",
+        title=f"[cyan]{label}[/cyan]",
+        border_style="cyan",
+    ))
 
     user_input = collect_multiline_input()
     if not user_input:
-        console.print("[warn]No input provided — skipping.[/warn]")
+        console.print("[warn]No input — skipping.[/warn]")
         return
 
-    console.print("\n[info]Formatting your context snippet…[/info]")
-    formatted = format_context(user_name, topic, user_input)
+    console.print("\n[info]Formatting snippet…[/info]")
+    formatted = format_context(profile.name, q.text, user_input)
     snippet_content = extract_snippet(formatted)
 
-    console.print(
-        Panel(
-            Markdown(snippet_content),
-            title="[green]Context Snippet[/green]",
-            border_style="bright_blue",
-        )
-    )
+    console.print(Panel(Markdown(snippet_content), title="[green]Snippet[/green]",
+                        border_style="bright_blue"))
 
-    if Confirm.ask("\n[info]Save this snippet to file?[/info]", default=True):
-        filepath = save_snippet(snippet_content, user_name, topic)
-        console.print(f"[success]Saved → {filepath}[/success]")
+    if not Confirm.ask("\n[info]Save this snippet?[/info]", default=True):
+        return
+
+    # Save file
+    profile.snippets_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{timestamp}_{q.id}.md"
+    filepath = profile.snippets_dir / filename
+    header = (f"---\ngenerated: {datetime.now().isoformat()}\n"
+              f"question_id: {q.id}\nquestion: {q.text}\n---\n\n")
+    filepath.write_text(header + snippet_content + "\n", encoding="utf-8")
+
+    # Remove old file if re-answering
+    if is_edit and q.id in profile.answered:
+        old_file = profile.snippets_dir / profile.answered[q.id]
+        if old_file.exists():
+            old_file.unlink()
+
+    profile.answered[q.id] = filename
+    profile.skipped = [s for s in profile.skipped if s != q.id]  # un-skip if was skipped
+    profile.save()
+    console.print(f"[success]Saved → {filepath}[/success]")
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+def run_session(profile: Profile) -> None:
+    """Main question loop for a session."""
+    show_progress(profile)
+
+    while True:
+        q = next_question(profile)
+
+        if q is None:
+            console.print(
+                "\n[success]All questions answered! "
+                "You can still edit previous answers.[/success]"
+            )
+            if not Confirm.ask("[info]Edit a previous answer?[/info]", default=False):
+                break
+            q = pick_answered_question(profile)
+            if q:
+                answer_question(profile, q, is_edit=True)
+            continue
+
+        console.print(Panel(
+            f"[bold]{q.text}[/bold]\n[dim]Section: {q.section}[/dim]",
+            title="[cyan]Next Question[/cyan]",
+            border_style="cyan",
+        ))
+
+        action = Prompt.ask(
+            "\n[info]\\[a]nswer  \\[s]kip  \\[e]dit previous  \\[q]uit[/info]",
+            default="a",
+        ).strip().lower()
+
+        if action == "q":
+            break
+        elif action == "s":
+            if q.id not in profile.skipped:
+                profile.skipped.append(q.id)
+                profile.save()
+            console.print("[info]Skipped.[/info]")
+        elif action == "e":
+            eq = pick_answered_question(profile)
+            if eq:
+                answer_question(profile, eq, is_edit=True)
+        else:  # "a" or anything else
+            answer_question(profile, q)
+
+
+# ── Startup ───────────────────────────────────────────────────────────────────
+
+def load_or_create_profile() -> Profile:
+    last = Profile.last_used_name()
+    if last:
+        if Confirm.ask(f"\n[info]Load profile for [bold]{last}[/bold]?[/info]", default=True):
+            profile = Profile.load(last)
+            console.print(f"[success]Loaded profile: {profile.name}[/success]")
+            return profile
+
+    name = Prompt.ask("\n[info]Enter your name[/info]").strip() or "User"
+    profile = Profile.load(name)  # loads existing or creates empty
+    profile.dir.mkdir(parents=True, exist_ok=True)
+    profile.snippets_dir.mkdir(exist_ok=True)
+    profile.save()
+    console.print(f"[success]Profile ready: {profile.dir}[/success]")
+    return profile
+
 
 def main() -> None:
-    console.print(
-        Panel(
-            "[bold]Context Data Generation Bot[/bold]\n"
-            "[dim]Build a personalized context library for your LLM[/dim]",
-            border_style="bright_blue",
-        )
-    )
+    console.print(Panel(
+        "[bold]Context Data Generation Bot[/bold]\n"
+        "[dim]Build a personalized context library for your LLM[/dim]",
+        border_style="bright_blue",
+    ))
 
-    # Verify the claude CLI is available
     if subprocess.run(["claude", "--version"], capture_output=True).returncode != 0:
         console.print(
             "[warn]The `claude` CLI was not found. "
@@ -238,18 +416,13 @@ def main() -> None:
         )
         sys.exit(1)
 
-    user_name = Prompt.ask("\n[info]What's your name?[/info]").strip() or "User"
-    console.print(f"\n[success]Hello, {user_name}! Let's build your context library.[/success]")
+    profile = load_or_create_profile()
+    run_session(profile)
 
-    while True:
-        run_session(user_name)
-        if not Confirm.ask("\n[info]Generate another snippet?[/info]", default=True):
-            break
-
-    snippet_count = len(list(Path("output").glob("*.md"))) if Path("output").exists() else 0
+    total = len(profile.answered)
     console.print(
-        f"\n[success]Session complete!"
-        f"{' ' + str(snippet_count) + ' snippet(s) saved in output/' if snippet_count else ''}[/success]"
+        f"\n[success]Session complete. "
+        f"{total} snippet{'s' if total != 1 else ''} in {profile.snippets_dir}[/success]"
     )
 
 
